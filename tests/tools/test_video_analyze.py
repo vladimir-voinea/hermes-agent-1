@@ -302,6 +302,33 @@ class TestVideoAnalyzeTool:
         assert "video_url" in content[1]
         assert content[1]["video_url"]["url"].startswith("data:video/mp4;base64,")
 
+    def test_youtube_url_uses_ytdlp_downloader(self, tmp_path):
+        """YouTube watch URLs are downloaded with yt-dlp, not plain HTTP."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "YouTube analysis result."
+
+        async def fake_ytdlp_download(video_url, destination):
+            assert video_url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+            destination.write_bytes(b"\x00" * 100)
+            return destination
+
+        with patch("tools.vision_tools._validate_image_url_async", new_callable=AsyncMock, return_value=True), \
+             patch("tools.vision_tools._download_video", new_callable=AsyncMock, side_effect=AssertionError("plain HTTP downloader should not be used for YouTube")), \
+             patch("tools.vision_tools._download_youtube_video", new_callable=AsyncMock, side_effect=fake_ytdlp_download, create=True) as mock_ytdlp, \
+             patch("tools.vision_tools.async_call_llm", new_callable=AsyncMock, return_value=mock_response), \
+             patch("tools.vision_tools.extract_content_or_reasoning", return_value="YouTube analysis result."):
+            result = self._run(
+                video_analyze_tool(
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    "What happens in this video?",
+                )
+            )
+
+        data = json.loads(result)
+        assert data["success"] is True
+        assert mock_ytdlp.await_count == 1
+
 
 # ---------------------------------------------------------------------------
 # Toolset registration

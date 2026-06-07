@@ -32,6 +32,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
@@ -1245,6 +1246,17 @@ _VIDEO_MIME_TYPES = {
 
 _MAX_VIDEO_BASE64_BYTES = 50 * 1024 * 1024  # 50 MB hard cap
 _VIDEO_SIZE_WARN_BYTES = 20 * 1024 * 1024
+_YTDLP_FORMAT = (
+    "b[ext=mp4][height<=360]/"
+    "bv*[ext=mp4][height<=360]+ba[ext=m4a]/"
+    "b[height<=360]/"
+    "worst[ext=mp4]/worst"
+)
+_YTDLP_CANDIDATES = (
+    "/opt/homebrew/bin/yt-dlp",
+    "/usr/local/bin/yt-dlp",
+    "/usr/bin/yt-dlp",
+)
 
 
 def _detect_video_mime_type(video_path: Path) -> Optional[str]:
@@ -1253,12 +1265,120 @@ def _detect_video_mime_type(video_path: Path) -> Optional[str]:
     return _VIDEO_MIME_TYPES.get(ext)
 
 
+def _is_youtube_video_url(url: str) -> bool:
+    """Return True for YouTube watch/short/share URLs that need yt-dlp."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").lower()
+    return (
+        host == "youtu.be"
+        or host == "youtube.com"
+        or host.endswith(".youtube.com")
+        or host == "youtube-nocookie.com"
+        or host.endswith(".youtube-nocookie.com")
+    )
+
+
+def _find_ytdlp_binary() -> Optional[str]:
+    """Find yt-dlp even under launchd's minimal PATH."""
+    found = shutil.which("yt-dlp")
+    if found:
+        return found
+    for candidate in _YTDLP_CANDIDATES:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _video_to_base64_data_url(video_path: Path, mime_type: Optional[str] = None) -> str:
     """Convert a video file to a base64-encoded data URL."""
     data = video_path.read_bytes()
     encoded = base64.b64encode(data).decode("ascii")
     mime = mime_type or _VIDEO_MIME_TYPES.get(video_path.suffix.lower(), "video/mp4")
     return f"data:{mime};base64,{encoded}"
+
+
+def _yt_dlp_download_candidates(destination: Path) -> list[Path]:
+    stem = destination.with_suffix("")
+    return sorted(
+        destination.parent.glob(f"{stem.name}.*"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+        reverse=True,
+    )
+
+
+def _select_yt_dlp_download(destination: Path) -> Path:
+    for candidate in _yt_dlp_download_candidates(destination):
+        if candidate.is_file() and candidate.stat().st_size > 0 and _detect_video_mime_type(candidate):
+            return candidate
+    raise FileNotFoundError("yt-dlp did not produce a supported video file")
+
+
+async def _download_youtube_video(video_url: str, destination: Path) -> Path:
+    """Download a YouTube video with yt-dlp and return the downloaded file path."""
+    import asyncio
+
+    blocked = check_website_access(video_url)
+    if blocked:
+        raise PermissionError(blocked["message"])
+    if not _is_youtube_video_url(video_url):
+        raise ValueError("Not a YouTube video URL")
+
+    ytdlp = _find_ytdlp_binary()
+    if not ytdlp:
+        raise RuntimeError(
+            "yt-dlp is required for YouTube video URLs. Install yt-dlp and retry."
+        )
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    output_template = str(destination.with_suffix(".%(ext)s"))
+    cmd = [
+        ytdlp,
+        "--no-playlist",
+        "--no-progress",
+        "--max-filesize",
+        "50M",
+        "--match-filter",
+        "!is_live",
+        "-f",
+        _YTDLP_FORMAT,
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        output_template,
+        video_url,
+    ]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=max(_VISION_DOWNLOAD_TIMEOUT, 600.0),
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise TimeoutError("yt-dlp timed out while downloading the YouTube video")
+
+    if proc.returncode != 0:
+        err = (stderr or stdout or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(f"yt-dlp failed: {err[-1000:] or f'exit {proc.returncode}'}")
+
+    downloaded = _select_yt_dlp_download(destination)
+    size = downloaded.stat().st_size
+    if size > _MAX_VIDEO_BASE64_BYTES:
+        raise ValueError(
+            f"Video too large ({size} bytes, max {_MAX_VIDEO_BASE64_BYTES})"
+        )
+    return downloaded
 
 
 async def _download_video(video_url: str, destination: Path, max_retries: int = 3) -> Path:
@@ -1377,6 +1497,12 @@ async def video_analyze_tool(
             logger.info("Using local video file: %s", video_url)
             temp_video_path = local_path
             should_cleanup = False
+        elif _is_youtube_video_url(video_url):
+            temp_dir = get_hermes_dir("cache/video", "temp_video_files")
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_video_path = temp_dir / f"temp_video_{uuid.uuid4()}.mp4"
+            temp_video_path = await _download_youtube_video(video_url, temp_video_path)
+            should_cleanup = True
         elif await _validate_image_url_async(video_url):
             blocked = check_website_access(video_url)
             if blocked:
@@ -1549,6 +1675,7 @@ VIDEO_ANALYZE_SCHEMA = {
         "Sends the video to a video-capable model (e.g. Gemini) for understanding. "
         "Use this for video files — for images, use vision_analyze instead. "
         "Supports mp4, webm, mov, avi, mkv, mpeg formats. "
+        "YouTube URLs are downloaded with yt-dlp before analysis. "
         "Note: large videos (>20 MB) may be slow; max ~50 MB."
     ),
     "parameters": {

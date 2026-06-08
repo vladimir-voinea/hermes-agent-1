@@ -329,6 +329,31 @@ class TestVideoAnalyzeTool:
         assert data["success"] is True
         assert mock_ytdlp.await_count == 1
 
+    def test_audio_transcript_is_added_to_video_prompt(self, tmp_path):
+        """Video analysis includes an extracted audio transcript when available."""
+        video = tmp_path / "test.mp4"
+        video.write_bytes(b"\x00" * 100)
+        captured_kwargs = {}
+
+        async def capture_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock()]
+            mock_response.choices[0].message.content = "OK"
+            return mock_response
+
+        with patch("tools.vision_tools._transcribe_video_audio", new_callable=AsyncMock, return_value={"success": True, "transcript": "spoken words from the clip"}, create=True) as mock_transcribe, \
+             patch("tools.vision_tools.async_call_llm", side_effect=capture_llm), \
+             patch("tools.vision_tools.extract_content_or_reasoning", return_value="OK"):
+            result = self._run(video_analyze_tool(str(video), "Describe this"))
+
+        data = json.loads(result)
+        assert data["success"] is True
+        mock_transcribe.assert_awaited_once()
+        prompt_text = captured_kwargs["messages"][0]["content"][0]["text"]
+        assert "Audio transcript from the video" in prompt_text
+        assert "spoken words from the clip" in prompt_text
+
 
 # ---------------------------------------------------------------------------
 # Toolset registration

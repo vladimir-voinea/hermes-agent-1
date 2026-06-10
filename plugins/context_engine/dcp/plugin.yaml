@@ -1,0 +1,5 @@
+name: dcp
+description: "Dynamic Context Pruning — intelligently prunes obsolete tool outputs and redundant conversation turns to optimize token usage."
+version: 1.0.0
+author: Hermes Agent
+license: MIT
